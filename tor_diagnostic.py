@@ -1,4 +1,5 @@
-"""Check whether requests are reaching the internet through the Tor network."""
+#!/usr/bin/env python3
+# """Check whether requests are reaching the internet through the Tor network."""
 
 from __future__ import annotations
 

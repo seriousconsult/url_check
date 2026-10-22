@@ -1,4 +1,5 @@
-"""Check URL and domain availability for Firefox bookmark exports."""
+#!/usr/bin/env python3
+"""Check URL and domain availability for Firefox bookmark exports and generate clean exports."""
 
 from __future__ import annotations
 
@@ -7,6 +8,7 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from html.parser import HTMLParser
+import re
 from pathlib import Path
 from typing import Callable, Literal, Sequence
 from urllib.parse import urlsplit
@@ -44,13 +46,7 @@ def _origin_url(url: str, scheme: str) -> str:
 
 
 def check_url(url: str, timeout: float = 10.0) -> URLCheckResult:
-    """Classify one URL as active, domain-only active, or dead.
-
-    Any HTTP response below 400 marks the URL active. An HTTP error response
-    marks the domain active. If the URL request fails, the domain root is
-    checked over the original scheme and then the alternate HTTP(S) scheme.
-    Request failures are returned in ``error`` rather than treated as success.
-    """
+    """Classify one URL as active, domain-only active, or dead."""
     _validate_timeout(timeout)
     if not isinstance(url, str):
         raise TypeError("url must be a string")
@@ -59,7 +55,6 @@ def check_url(url: str, timeout: float = 10.0) -> URLCheckResult:
         parts = urlsplit(url)
         if parts.scheme.lower() not in {"http", "https"} or parts.hostname is None:
             return URLCheckResult(url=url, availability="dead", error="invalid HTTP(S) URL")
-        # Accessing port also validates malformed port numbers.
         parts.port
     except ValueError:
         return URLCheckResult(url=url, availability="dead", error="invalid HTTP(S) URL")
@@ -126,7 +121,7 @@ def check_urls(
     timeout: float = 10.0,
     on_result: Callable[[URLCheckResult], None] | None = None,
 ) -> list[URLCheckResult]:
-    """Check URLs concurrently, preserving result order and reporting completions."""
+    """Check URLs concurrently, preserving result order."""
     if not 2 <= max_workers <= 5:
         raise ValueError("max_workers must be between 2 and 5")
     _validate_timeout(timeout)
@@ -147,64 +142,6 @@ def check_urls(
     return [completed[index] for index in range(len(urls))]
 
 
-def check_bookmark_file(
-    file_path: str | Path,
-    max_workers: int = 3,
-    timeout: float = 10.0,
-    on_result: Callable[[URLCheckResult], None] | None = None,
-) -> list[URLCheckResult]:
-    """Parse Firefox bookmark HTML and check each bookmarked URL."""
-    parser = _parse_bookmark_file(Path(file_path))
-    if on_result is None:
-        return check_urls(parser.urls, max_workers=max_workers, timeout=timeout)
-    return check_urls(
-        parser.urls,
-        max_workers=max_workers,
-        timeout=timeout,
-        on_result=on_result,
-    )
-
-
-def check_bookmark_folder(
-    folder_path: str | Path | None = None,
-    max_workers: int = 3,
-    timeout: float = 10.0,
-    on_result: Callable[[URLCheckResult], None] | None = None,
-) -> list[URLCheckResult]:
-    """Check exports in a folder, defaulting to this project's bookmarks folder."""
-    folder = (
-        Path(folder_path)
-        if folder_path is not None
-        else Path(__file__).resolve().parent / "bookmarks"
-    )
-    if not folder.is_dir():
-        raise NotADirectoryError(f"Bookmark export folder does not exist: {folder}")
-
-    bookmark_files = sorted(
-        (
-            path
-            for path in folder.iterdir()
-            if path.is_file() and path.suffix.lower() in {".html", ".htm"}
-        ),
-        key=lambda path: path.name.casefold(),
-    )
-    if not bookmark_files:
-        raise FileNotFoundError(f"No HTML bookmark exports found in: {folder}")
-
-    urls: list[str] = []
-    for bookmark_file in bookmark_files:
-        urls.extend(_parse_bookmark_file(bookmark_file).urls)
-
-    if on_result is None:
-        return check_urls(urls, max_workers=max_workers, timeout=timeout)
-    return check_urls(
-        urls,
-        max_workers=max_workers,
-        timeout=timeout,
-        on_result=on_result,
-    )
-
-
 def _parse_bookmark_file(file_path: Path) -> _BookmarkParser:
     html = file_path.read_text(encoding="utf-8-sig")
     parser = _BookmarkParser()
@@ -213,15 +150,61 @@ def _parse_bookmark_file(file_path: Path) -> _BookmarkParser:
     return parser
 
 
+def process_single_file(
+    input_file: Path,
+    output_file: Path,
+    max_workers: int = 3,
+    timeout: float = 10.0,
+    on_result: Callable[[URLCheckResult], None] | None = None,
+) -> tuple[list[URLCheckResult], int]:
+    """Check URLs for a single HTML file and output a cleaned version."""
+    parser = _parse_bookmark_file(input_file)
+    results = check_urls(
+        parser.urls,
+        max_workers=max_workers,
+        timeout=timeout,
+        on_result=on_result,
+    )
+
+    dead_urls = {res.url for res in results if res.availability == "dead"}
+    raw_html = input_file.read_text(encoding="utf-8-sig")
+
+    pattern = re.compile(
+        r"^[ \t]*<DT><A\b[^>]*\bHREF=[\"'](?P<url>[^\"']+)[\"'][^>]*>.*?</A>.*?\n?",
+        flags=re.IGNORECASE | re.MULTILINE,
+    )
+
+    removed_count = 0
+
+    def replace_dead(match: re.Match) -> str:
+        nonlocal removed_count
+        href = match.group("url")
+        if href in dead_urls:
+            removed_count += 1
+            return ""
+        return match.group(0)
+
+    cleaned_html = pattern.sub(replace_dead, raw_html)
+    output_file.write_text(cleaned_html, encoding="utf-8")
+    return results, removed_count
+
+
 def main(argv: Sequence[str] | None = None) -> int:
-    """Run the checker from the command line and print results as they finish."""
+    """CLI to process single files or scan the entire ./bookmarks folder."""
     argument_parser = argparse.ArgumentParser(
-        description="Check URLs in Firefox bookmark HTML exports."
+        description="Filter dead domains from Firefox bookmark HTML exports."
     )
     argument_parser.add_argument(
-        "folder",
+        "target",
         nargs="?",
-        help="folder containing .html/.htm exports (default: ./bookmarks)",
+        type=Path,
+        help="path to a specific .html file OR a folder (default: ./bookmarks)",
+    )
+    argument_parser.add_argument(
+        "-o",
+        "--output",
+        type=Path,
+        help="custom output path (only valid when processing a single file)",
     )
     argument_parser.add_argument(
         "--workers",
@@ -239,7 +222,29 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     args = argument_parser.parse_args(argv)
 
-    print("Checking bookmarks...", flush=True)
+    # Determine execution mode (Directory scan vs Single File)
+    target_path = args.target if args.target is not None else Path("bookmarks")
+
+    if not target_path.exists():
+        print(f"Error: Target path does not exist: {target_path}")
+        return 1
+
+    files_to_process: list[tuple[Path, Path]] = []
+
+    if target_path.is_dir():
+        html_files = sorted(
+            [p for p in target_path.iterdir() if p.is_file() and p.suffix.lower() in {".html", ".htm"}]
+        )
+        if not html_files:
+            print(f"Error: No .html/.htm bookmark files found inside directory: {target_path}")
+            return 1
+
+        for file in html_files:
+            out_file = file.parent / f"{file.stem}_clean{file.suffix}"
+            files_to_process.append((file, out_file))
+    else:
+        out_file = args.output if args.output else target_path.parent / f"{target_path.stem}_clean{target_path.suffix}"
+        files_to_process.append((target_path, out_file))
 
     def print_result(result: URLCheckResult) -> None:
         status = str(result.http_status) if result.http_status is not None else "-"
@@ -247,23 +252,29 @@ def main(argv: Sequence[str] | None = None) -> int:
         label = {
             "url_active": "ALIVE",
             "domain_active": "URL DEAD / DOMAIN ALIVE",
-            "dead": "DEAD",
+            "dead": "DEAD (REMOVING)",
         }[result.availability]
         print(f"{label:23} {status:>3}  {result.url}{details}", flush=True)
 
-    results = check_bookmark_folder(
-        folder_path=args.folder,
-        max_workers=args.workers,
-        timeout=args.timeout,
-        on_result=print_result,
-    )
-    counts = Counter(result.availability for result in results)
-    print(
-        f"\nChecked {len(results)} URL(s): "
-        f"{counts['url_active']} active, "
-        f"{counts['domain_active']} domain active, "
-        f"{counts['dead']} dead."
-    )
+    for in_file, out_file in files_to_process:
+        print(f"\nProcessing '{in_file}'...", flush=True)
+        results, removed_count = process_single_file(
+            input_file=in_file,
+            output_file=out_file,
+            max_workers=args.workers,
+            timeout=args.timeout,
+            on_result=print_result,
+        )
+
+        counts = Counter(res.availability for res in results)
+        print(
+            f"Finished {in_file.name}:\n"
+            f"  - {counts['url_active']} active URLs\n"
+            f"  - {counts['domain_active']} domain active URLs\n"
+            f"  - {counts['dead']} dead domains removed\n"
+            f"  - Cleaned file saved to: {out_file.resolve()}"
+        )
+
     return 0
 
 
