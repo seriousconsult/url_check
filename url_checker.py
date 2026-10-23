@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from html.parser import HTMLParser
 import re
@@ -14,6 +14,8 @@ from typing import Callable, Literal, Sequence
 from urllib.parse import urlsplit
 
 import requests
+
+from tor_diagnostic import is_using_tor
 
 
 Availability = Literal["url_active", "domain_active", "dead"]
@@ -120,6 +122,7 @@ def check_urls(
     max_workers: int = 3,
     timeout: float = 10.0,
     on_result: Callable[[URLCheckResult], None] | None = None,
+    on_wait: Callable[[int, int], None] | None = None,
 ) -> list[URLCheckResult]:
     """Check URLs concurrently, preserving result order."""
     if not 2 <= max_workers <= 5:
@@ -128,16 +131,27 @@ def check_urls(
 
     completed: dict[int, URLCheckResult] = {}
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        for start in range(0, len(urls), max_workers):
-            futures = {
-                executor.submit(check_url, url, timeout): index
-                for index, url in enumerate(urls[start : start + max_workers], start)
-            }
-            for future in as_completed(futures):
+        remaining = iter(enumerate(urls))
+        futures = {}
+
+        def submit_next() -> None:
+            item = next(remaining, None)
+            if item is not None:
+                index, url = item
+                futures[executor.submit(check_url, url, timeout)] = index
+
+        for _ in range(max_workers):
+            submit_next()
+        while futures:
+            done, _ = wait(futures, timeout=5.0, return_when=FIRST_COMPLETED)
+            if not done and on_wait is not None:
+                on_wait(len(completed), len(urls))
+            for future in done:
                 result = future.result()
-                completed[futures[future]] = result
+                completed[futures.pop(future)] = result
                 if on_result is not None:
                     on_result(result)
+                submit_next()
 
     return [completed[index] for index in range(len(urls))]
 
@@ -156,6 +170,7 @@ def process_single_file(
     max_workers: int = 3,
     timeout: float = 10.0,
     on_result: Callable[[URLCheckResult], None] | None = None,
+    on_wait: Callable[[int, int], None] | None = None,
 ) -> tuple[list[URLCheckResult], int]:
     """Check URLs for a single HTML file and output a cleaned version."""
     parser = _parse_bookmark_file(input_file)
@@ -164,6 +179,7 @@ def process_single_file(
         max_workers=max_workers,
         timeout=timeout,
         on_result=on_result,
+        on_wait=on_wait,
     )
 
     dead_urls = {res.url for res in results if res.availability == "dead"}
@@ -246,6 +262,28 @@ def main(argv: Sequence[str] | None = None) -> int:
         out_file = args.output if args.output else target_path.parent / f"{target_path.stem}_clean{target_path.suffix}"
         files_to_process.append((target_path, out_file))
 
+    _validate_timeout(args.timeout)
+    print("Checking Tor connection...", flush=True)
+    try:
+        using_tor = is_using_tor(timeout=args.timeout)
+    except (requests.RequestException, ValueError) as error:
+        print(f"Tor status: UNKNOWN (diagnostic failed: {error})", flush=True)
+    else:
+        print(
+            "Tor status: ACTIVE (requests use Tor)"
+            if using_tor
+            else "Tor status: INACTIVE (requests do not use Tor)",
+            flush=True,
+        )
+
+    try:
+        confirmation = input("Type 'yes' to continue checking bookmarks: ")
+    except (EOFError, KeyboardInterrupt):
+        confirmation = ""
+    if confirmation.strip().lower() != "yes":
+        print("Cancelled. No bookmarks were checked or output files written.")
+        return 0
+
     def print_result(result: URLCheckResult) -> None:
         status = str(result.http_status) if result.http_status is not None else "-"
         details = f" ({result.error})" if result.error else ""
@@ -264,6 +302,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             max_workers=args.workers,
             timeout=args.timeout,
             on_result=print_result,
+            on_wait=lambda completed, total: print(
+                f"Still checking: {completed}/{total} URLs completed; waiting for network responses...",
+                flush=True,
+            ),
         )
 
         counts = Counter(res.availability for res in results)

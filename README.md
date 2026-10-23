@@ -39,6 +39,13 @@ folder and display each result as it completes:
 python url_checker.py
 ```
 
+Before checking bookmarks, the command contacts the Tor Project's check
+endpoint and reports whether its requests use Tor (active, inactive, or
+unknown if the diagnostic fails). Type `yes` at the prompt to continue.
+Any other response, end of input, or Ctrl+C cancels before checking bookmarks
+or writing cleaned exports. This checks the current connection; it does not
+start Tor or configure a proxy.
+
 You can specify another folder and adjust concurrency and timeout:
 
 ```powershell
@@ -87,6 +94,12 @@ check individual URLs or an existing list, use `check_url(url)` or
 may increase load on your network and the sites being checked. The timeout
 defaults to 10 seconds per request; failed URL checks may also try the domain
 root over HTTP and HTTPS.
+
+Workers start the next URL as soon as a check finishes. While no results
+arrive, the command prints a progress update every five seconds. The timeout
+applies to each request's network waits, not the entire run; a failed URL
+can require three requests. Cleaned exports are written after each input
+file finishes.
 
 ## Tor diagnostic
 
