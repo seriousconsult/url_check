@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import math
+import multiprocessing
 from collections import Counter
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
@@ -11,14 +13,14 @@ from html.parser import HTMLParser
 import re
 from pathlib import Path
 from typing import Callable, Literal, Sequence
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 
 import requests
 
 from tor_diagnostic import is_using_tor
 
 
-Availability = Literal["url_active", "domain_active", "dead"]
+Availability = Literal["url_active", "domain_active", "dead", "unknown"]
 
 
 @dataclass(frozen=True)
@@ -31,8 +33,8 @@ class URLCheckResult:
 
 
 def _validate_timeout(timeout: float) -> None:
-    if timeout <= 0:
-        raise ValueError("timeout must be greater than zero")
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError("timeout must be finite and greater than zero")
 
 
 def _origin_url(url: str, scheme: str) -> str:
@@ -101,6 +103,55 @@ def check_url(url: str, timeout: float = 10.0) -> URLCheckResult:
     )
 
 
+def _check_url_worker(connection, url: str, timeout: float) -> None:
+    """Send one result from an isolated, terminable network worker."""
+    try:
+        try:
+            result = check_url(url, timeout)
+        except Exception as error:
+            result = URLCheckResult(
+                url, "unknown", error=f"network worker failed ({type(error).__name__})"
+            )
+        connection.send(result)
+    finally:
+        connection.close()
+
+
+def _bounded_check_url(url: str, timeout: float) -> URLCheckResult:
+    # Spawn is safe from executor threads and works on Windows as well as Unix.
+    context = multiprocessing.get_context("spawn")
+    reader, writer = context.Pipe(duplex=False)
+    process = context.Process(target=_check_url_worker, args=(writer, url, timeout))
+    budget = 3 * timeout + 5  # Three request attempts plus startup overhead.
+    try:
+        try:
+            process.start()
+        except (OSError, RuntimeError) as error:
+            return URLCheckResult(
+                url, "unknown", error=f"could not start network worker ({type(error).__name__})"
+            )
+        writer.close()
+        if reader.poll(budget):
+            try:
+                return reader.recv()
+            except EOFError:
+                return URLCheckResult(url, "unknown", error="network worker exited without a result")
+        return URLCheckResult(
+            url, "unknown", error=f"check exceeded {budget:g}s deadline; bookmark retained"
+        )
+    finally:
+        reader.close()
+        writer.close()
+        if process.pid is not None:
+            if process.is_alive():
+                process.terminate()
+            process.join(timeout=1)
+            if process.is_alive():
+                process.kill()
+                process.join()
+            process.close()
+
+
 class _BookmarkParser(HTMLParser):
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
@@ -138,7 +189,7 @@ def check_urls(
             item = next(remaining, None)
             if item is not None:
                 index, url = item
-                futures[executor.submit(check_url, url, timeout)] = index
+                futures[executor.submit(_bounded_check_url, url, timeout)] = index
 
         for _ in range(max_workers):
             submit_next()
@@ -162,6 +213,85 @@ def _parse_bookmark_file(file_path: Path) -> _BookmarkParser:
     parser.feed(html)
     parser.close()
     return parser
+
+
+class _MergeParser(HTMLParser):
+    """Locate duplicate anchors while preserving the original export markup."""
+
+    def __init__(self, html: str, seen: set[str]) -> None:
+        super().__init__(convert_charrefs=True)
+        self.html = html
+        self.seen = seen
+        self.offsets = [0]
+        for match in re.finditer("\n", html):
+            self.offsets.append(match.end())
+        self.removals: list[tuple[int, int]] = []
+        self.duplicate_start: int | None = None
+        self.total = 0
+        self.duplicates = 0
+
+    def source_offset(self) -> int:
+        line, column = self.getpos()
+        return self.offsets[line - 1] + column
+
+    def handle_starttag(self, tag, attrs) -> None:
+        if tag.lower() != "a":
+            return
+        href = dict(attrs).get("href")
+        if not href:
+            return
+        self.total += 1
+        # Query parameters do not distinguish bookmarks; keep the first full URL.
+        parts = urlsplit(href)
+        key = urlunsplit((parts.scheme, parts.netloc, parts.path, "", parts.fragment))
+        if key in self.seen:
+            self.duplicates += 1
+            self.duplicate_start = self.source_offset()
+        else:
+            self.seen.add(key)
+
+    def handle_endtag(self, tag) -> None:
+        if tag.lower() == "a" and self.duplicate_start is not None:
+            end = self.html.index(">", self.source_offset()) + 1
+            start = self.duplicate_start
+            prefix = re.search(r"<DT>\s*$", self.html[:start], re.IGNORECASE)
+            if prefix:
+                start = prefix.start()
+            self.removals.append((start, end))
+            self.duplicate_start = None
+
+
+def merge_bookmark_files(input_files: Sequence[Path], output_file: Path) -> tuple[int, int]:
+    """Merge exports in order, retaining the first URL regardless of query string."""
+    if any(path.resolve() == output_file.resolve() for path in input_files):
+        raise ValueError("Merged output must not overwrite an input file")
+    seen: set[str] = set()
+    sections = []
+    total = duplicates = 0
+    for path in input_files:
+        html = path.read_text(encoding="utf-8-sig")
+        parser = _MergeParser(html, seen)
+        parser.feed(html)
+        parser.close()
+        for start, end in reversed(parser.removals):
+            html = html[:start] + html[end:]
+        # Netscape exports wrap all folders and bookmarks in one outer DL.
+        opening = re.search(r"<DL\b[^>]*>", html, re.IGNORECASE)
+        closings = list(re.finditer(r"</DL\s*>", html, re.IGNORECASE))
+        if opening and closings:
+            sections.append(html[opening.end():closings[-1].start()])
+        elif parser.total:
+            raise ValueError(f"Bookmark export has no enclosing DL: {path}")
+        total += parser.total
+        duplicates += parser.duplicates
+    output_file.write_text(
+        '<!DOCTYPE NETSCAPE-Bookmark-file-1>\n'
+        '<META HTTP-EQUIV="Content-Type" CONTENT="text/html; charset=UTF-8">\n'
+        '<TITLE>Bookmarks</TITLE>\n<H1>Bookmarks</H1>\n<DL><p>\n'
+        + "\n".join(sections) + '\n</DL><p>\n',
+        encoding="utf-8",
+    )
+    return total - duplicates, duplicates
 
 
 def process_single_file(
@@ -205,10 +335,44 @@ def process_single_file(
     return results, removed_count
 
 
+def _select_merge_files(files: Sequence[Path]) -> list[Path]:
+    print("Bookmark files available to merge:", flush=True)
+    for number, path in enumerate(files, start=1):
+        print(f"  {number}. {path.name}", flush=True)
+    if len(files) < 2:
+        print("At least two files are required to merge.")
+        return []
+    while True:
+        try:
+            answer = input(
+                "Which files should be merged? Enter numbers (e.g. 1,3), 'all', or 'cancel': "
+            ).strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            return []
+        if answer in {"", "cancel"}:
+            return []
+        if answer == "all":
+            return list(files)
+        try:
+            numbers = {int(value) for value in re.split(r"[,\s]+", answer)}
+        except ValueError:
+            print("Enter file numbers separated by commas or spaces, or 'all'.")
+            continue
+        if len(numbers) < 2 or not numbers <= set(range(1, len(files) + 1)):
+            print("Select at least two different file numbers from the list.")
+            continue
+        return [path for number, path in enumerate(files, start=1) if number in numbers]
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """CLI to process single files or scan the entire ./bookmarks folder."""
     argument_parser = argparse.ArgumentParser(
         description="Filter dead domains from Firefox bookmark HTML exports."
+    )
+    argument_parser.add_argument(
+        "--merge",
+        action="store_true",
+        help="choose folder exports to merge, ignoring query strings for duplicates",
     )
     argument_parser.add_argument(
         "target",
@@ -220,7 +384,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "-o",
         "--output",
         type=Path,
-        help="custom output path (only valid when processing a single file)",
+        help="custom cleaned output path (single file or merged folder)",
     )
     argument_parser.add_argument(
         "--workers",
@@ -238,6 +402,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     args = argument_parser.parse_args(argv)
 
+    _validate_timeout(args.timeout)
     # Determine execution mode (Directory scan vs Single File)
     target_path = args.target if args.target is not None else Path("bookmarks")
 
@@ -249,20 +414,52 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if target_path.is_dir():
         html_files = sorted(
-            [p for p in target_path.iterdir() if p.is_file() and p.suffix.lower() in {".html", ".htm"}]
+            [p for p in target_path.iterdir()
+             if p.is_file() and p.suffix.lower() in {".html", ".htm"}
+             and not p.stem.lower().endswith("_clean")
+             and p.name.lower() != "merged_bookmarks.html"]
         )
         if not html_files:
             print(f"Error: No .html/.htm bookmark files found inside directory: {target_path}")
             return 1
 
-        for file in html_files:
-            out_file = file.parent / f"{file.stem}_clean{file.suffix}"
-            files_to_process.append((file, out_file))
+        merge = args.merge
+        if len(html_files) > 1 and not merge:
+            try:
+                answer = input(f"Merge {len(html_files)} bookmark files and remove duplicates first? [y/N]: ")
+            except (EOFError, KeyboardInterrupt):
+                print("Cancelled. No files written.")
+                return 0
+            merge = answer.strip().lower() in {"y", "yes"}
+        if args.output and not merge:
+            argument_parser.error("--output requires a single file or a merged folder")
+        if merge:
+            selected_files = _select_merge_files(html_files)
+            if not selected_files:
+                print("Cancelled. No files written.")
+                return 0
+            merged_file = target_path / "merged_bookmarks.html"
+            out_file = args.output or target_path / "merged_bookmarks_clean.html"
+            if out_file.resolve() in {p.resolve() for p in [*html_files, merged_file]}:
+                argument_parser.error("cleaned output must not overwrite an input or the merged export")
+            try:
+                unique, duplicates = merge_bookmark_files(selected_files, merged_file)
+            except (OSError, ValueError) as error:
+                print(f"Error merging bookmarks: {error}")
+                return 1
+            print(f"Merged {len(selected_files)} files: {unique} bookmarks, {duplicates} duplicates removed.", flush=True)
+            print(f"Merged export saved to: {merged_file.resolve()}", flush=True)
+            files_to_process.append((merged_file, out_file))
+        else:
+            for file in html_files:
+                out_file = file.parent / f"{file.stem}_clean{file.suffix}"
+                files_to_process.append((file, out_file))
     else:
+        if args.merge:
+            argument_parser.error("--merge requires a folder of bookmark exports")
         out_file = args.output if args.output else target_path.parent / f"{target_path.stem}_clean{target_path.suffix}"
         files_to_process.append((target_path, out_file))
 
-    _validate_timeout(args.timeout)
     print("Checking Tor connection...", flush=True)
     try:
         using_tor = is_using_tor(timeout=args.timeout)
@@ -281,7 +478,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     except (EOFError, KeyboardInterrupt):
         confirmation = ""
     if confirmation.strip().lower() != "yes":
-        print("Cancelled. No bookmarks were checked or output files written.")
+        print("Cancelled. No bookmarks were checked or cleaned exports written.")
         return 0
 
     def print_result(result: URLCheckResult) -> None:
@@ -291,6 +488,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "url_active": "ALIVE",
             "domain_active": "URL DEAD / DOMAIN ALIVE",
             "dead": "DEAD (REMOVING)",
+            "unknown": "TIMED OUT / RETAINED",
         }[result.availability]
         print(f"{label:23} {status:>3}  {result.url}{details}", flush=True)
 
@@ -314,6 +512,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"  - {counts['url_active']} active URLs\n"
             f"  - {counts['domain_active']} domain active URLs\n"
             f"  - {counts['dead']} dead domains removed\n"
+            f"  - {counts['unknown']} inconclusive checks retained\n"
             f"  - Cleaned file saved to: {out_file.resolve()}"
         )
 

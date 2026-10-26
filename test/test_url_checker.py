@@ -11,8 +11,7 @@ import requests
 
 from url_checker import (
     URLCheckResult,
-    check_bookmark_file,
-    check_bookmark_folder,
+    process_single_file,
     check_url,
     check_urls,
     main,
@@ -67,57 +66,30 @@ class URLCheckerTests(unittest.TestCase):
 
         self.assertEqual(result.availability, "dead")
 
-    def test_bookmark_file_extracts_anchor_urls(self) -> None:
-        html = '<DL><DT><A HREF="https://example.com/">Example</A></DL>'
+    def test_cleaned_export_retains_inconclusive_bookmarks(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "bookmarks.html"
-            path.write_text(html, encoding="utf-8")
-
-            with patch("url_checker.check_urls", return_value=[]) as check:
-                check_bookmark_file(path)
-
-        check.assert_called_once_with(["https://example.com/"], max_workers=3, timeout=10.0)
-
-    def test_bookmark_folder_combines_html_exports(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            folder = Path(directory)
-            (folder / "B.html").write_text(
-                '<A HREF="https://b.example/">B</A>', encoding="utf-8"
+            source = Path(directory) / "bookmarks.html"
+            output = Path(directory) / "clean.html"
+            source.write_text(
+                '<DT><A HREF="https://slow.example/">Slow</A>\n'
+                '<DT><A HREF="https://dead.example/">Dead</A>\n',
+                encoding="utf-8",
             )
-            (folder / "a.htm").write_text(
-                '<A HREF="https://a.example/">A</A>', encoding="utf-8"
-            )
-            (folder / "ignore.txt").write_text(
-                '<A HREF="https://ignored.example/">Ignored</A>', encoding="utf-8"
-            )
-
-            with patch("url_checker.check_urls", return_value=[]) as check:
-                check_bookmark_folder(folder)
-
-        check.assert_called_once_with(
-            ["https://a.example/", "https://b.example/"],
-            max_workers=3,
-            timeout=10.0,
-        )
-
-    def test_bookmark_folder_errors_if_no_exports(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            with self.assertRaises(FileNotFoundError):
-                check_bookmark_folder(directory)
-
-    def test_default_bookmark_folder_uses_project_bookmarks(self) -> None:
-        with patch("url_checker.check_urls", return_value=[]) as check:
-            check_bookmark_folder()
-
-        urls = check.call_args.args[0]
-        self.assertTrue(urls)
-        self.assertEqual(check.call_args.kwargs, {"max_workers": 3, "timeout": 10.0})
+            results = [
+                URLCheckResult("https://slow.example/", "unknown"),
+                URLCheckResult("https://dead.example/", "dead"),
+            ]
+            with patch("url_checker.check_urls", return_value=results):
+                _, removed = process_single_file(source, output)
+            self.assertEqual(removed, 1)
+            self.assertIn("https://slow.example/", output.read_text())
+            self.assertNotIn("https://dead.example/", output.read_text())
 
     def test_worker_count_is_limited(self) -> None:
         with self.assertRaises(ValueError):
             check_urls([], max_workers=6)
 
-    @patch("url_checker.check_url")
+    @patch("url_checker._bounded_check_url")
     def test_check_urls_reports_results_and_preserves_order(
         self,
         check: MagicMock,
@@ -145,23 +117,25 @@ class URLCheckerTests(unittest.TestCase):
             URLCheckResult("https://dead.example", "dead", error="ConnectionError"),
         ]
 
-        def check_folder(**kwargs: object) -> list[URLCheckResult]:
-            on_result = kwargs["on_result"]
-            assert callable(on_result)
+        def process(**kwargs):
             for result in results:
-                on_result(result)
-            return results
+                kwargs["on_result"](result)
+            return results, 1
 
         output = io.StringIO()
-        with patch("url_checker.check_bookmark_folder", side_effect=check_folder):
-            with redirect_stdout(output):
-                main([])
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "bookmarks.html"
+            source.write_text("<DL></DL>")
+            with patch("url_checker.process_single_file", side_effect=process), \
+                 patch("url_checker.is_using_tor", return_value=False), \
+                 patch("builtins.input", return_value="yes"), redirect_stdout(output):
+                main([str(source)])
 
         self.assertIn("ALIVE", output.getvalue())
         self.assertIn("DEAD", output.getvalue())
         self.assertIn("https://active.example", output.getvalue())
         self.assertIn("https://dead.example", output.getvalue())
-        self.assertIn("Checked 2 URL(s): 1 active, 0 domain active, 1 dead.", output.getvalue())
+        self.assertIn("1 dead domains removed", output.getvalue())
 
 
 if __name__ == "__main__":
