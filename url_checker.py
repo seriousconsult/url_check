@@ -7,6 +7,7 @@ import argparse
 import math
 import multiprocessing
 from collections import Counter
+from contextlib import ExitStack
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from html.parser import HTMLParser
@@ -18,6 +19,7 @@ from urllib.parse import urlsplit, urlunsplit
 import requests
 
 from tor_diagnostic import is_using_tor
+from slow_network import SlowNetworkProxy
 
 
 Availability = Literal["url_active", "domain_active", "dead", "unknown"]
@@ -49,7 +51,7 @@ def _origin_url(url: str, scheme: str) -> str:
     return f"{scheme}://{netloc}/"
 
 
-def check_url(url: str, timeout: float = 10.0) -> URLCheckResult:
+def check_url(url: str, timeout: float = 10.0, proxy_url: str | None = None) -> URLCheckResult:
     """Classify one URL as active, domain-only active, or dead."""
     _validate_timeout(timeout)
     if not isinstance(url, str):
@@ -63,8 +65,9 @@ def check_url(url: str, timeout: float = 10.0) -> URLCheckResult:
     except ValueError:
         return URLCheckResult(url=url, availability="dead", error="invalid HTTP(S) URL")
 
+    proxy_options = {"proxies": {"http": proxy_url, "https": proxy_url}} if proxy_url else {}
     try:
-        with requests.get(url, timeout=timeout, stream=True) as response:
+        with requests.get(url, timeout=timeout, stream=True, **proxy_options) as response:
             availability: Availability = (
                 "url_active" if response.status_code < 400 else "domain_active"
             )
@@ -85,6 +88,7 @@ def check_url(url: str, timeout: float = 10.0) -> URLCheckResult:
                 _origin_url(url, scheme),
                 timeout=timeout,
                 stream=True,
+                **proxy_options,
             ) as response:
                 return URLCheckResult(
                     url=url,
@@ -103,11 +107,11 @@ def check_url(url: str, timeout: float = 10.0) -> URLCheckResult:
     )
 
 
-def _check_url_worker(connection, url: str, timeout: float) -> None:
+def _check_url_worker(connection, url: str, timeout: float, proxy_url: str | None = None) -> None:
     """Send one result from an isolated, terminable network worker."""
     try:
         try:
-            result = check_url(url, timeout)
+            result = check_url(url, timeout, proxy_url)
         except Exception as error:
             result = URLCheckResult(
                 url, "unknown", error=f"network worker failed ({type(error).__name__})"
@@ -117,11 +121,12 @@ def _check_url_worker(connection, url: str, timeout: float) -> None:
         connection.close()
 
 
-def _bounded_check_url(url: str, timeout: float) -> URLCheckResult:
+def _bounded_check_url(url: str, timeout: float, proxy_url: str | None = None) -> URLCheckResult:
     # Spawn is safe from executor threads and works on Windows as well as Unix.
     context = multiprocessing.get_context("spawn")
     reader, writer = context.Pipe(duplex=False)
-    process = context.Process(target=_check_url_worker, args=(writer, url, timeout))
+    worker_args = (writer, url, timeout) + ((proxy_url,) if proxy_url else ())
+    process = context.Process(target=_check_url_worker, args=worker_args)
     budget = 3 * timeout + 5  # Three request attempts plus startup overhead.
     try:
         try:
@@ -174,6 +179,7 @@ def check_urls(
     timeout: float = 10.0,
     on_result: Callable[[URLCheckResult], None] | None = None,
     on_wait: Callable[[int, int], None] | None = None,
+    proxy_url: str | None = None,
 ) -> list[URLCheckResult]:
     """Check URLs concurrently, preserving result order."""
     if not 2 <= max_workers <= 5:
@@ -189,7 +195,8 @@ def check_urls(
             item = next(remaining, None)
             if item is not None:
                 index, url = item
-                futures[executor.submit(_bounded_check_url, url, timeout)] = index
+                options = {"proxy_url": proxy_url} if proxy_url else {}
+                futures[executor.submit(_bounded_check_url, url, timeout, **options)] = index
 
         for _ in range(max_workers):
             submit_next()
@@ -301,6 +308,7 @@ def process_single_file(
     timeout: float = 10.0,
     on_result: Callable[[URLCheckResult], None] | None = None,
     on_wait: Callable[[int, int], None] | None = None,
+    proxy_url: str | None = None,
 ) -> tuple[list[URLCheckResult], int]:
     """Check URLs for a single HTML file and output a cleaned version."""
     parser = _parse_bookmark_file(input_file)
@@ -310,6 +318,7 @@ def process_single_file(
         timeout=timeout,
         on_result=on_result,
         on_wait=on_wait,
+        proxy_url=proxy_url,
     )
 
     dead_urls = {res.url for res in results if res.availability == "dead"}
@@ -365,6 +374,11 @@ def _select_merge_files(files: Sequence[Path]) -> list[Path]:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    with ExitStack() as stack:
+        return _main(argv, stack)
+
+
+def _main(argv: Sequence[str] | None, stack: ExitStack) -> int:
     """CLI to process single files or scan the entire ./bookmarks folder."""
     argument_parser = argparse.ArgumentParser(
         description="Filter dead domains from Firefox bookmark HTML exports."
@@ -400,7 +414,26 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=10.0,
         help="timeout in seconds per request (default: 10)",
     )
+    network = argument_parser.add_mutually_exclusive_group()
+    network.add_argument("--simulate-slow", action="store_true",
+                         help="start a local slow testing proxy (does not enable Tor)")
+    network.add_argument("--proxy", help="HTTP proxy URL, e.g. http://127.0.0.1:8888")
+    argument_parser.add_argument("--slow-latency", type=float, default=1.5,
+                                 help="simulated connection delay in seconds (default: 1.5)")
+    argument_parser.add_argument("--slow-jitter", type=float, default=0.5,
+                                 help="random +/- connection delay in seconds (default: 0.5)")
+    argument_parser.add_argument("--slow-bandwidth", type=float, default=32,
+                                 help="KiB/s per connection per direction (default: 32)")
     args = argument_parser.parse_args(argv)
+    proxy_url = args.proxy
+    if args.simulate_slow:
+        try:
+            simulator = stack.enter_context(SlowNetworkProxy(
+                args.slow_latency, args.slow_jitter, args.slow_bandwidth))
+        except (ValueError, OSError) as error:
+            argument_parser.error(str(error))
+        proxy_url = simulator.url
+        print(f"Slow network simulation: {proxy_url}; no Tor routing or anonymity.", flush=True)
 
     _validate_timeout(args.timeout)
     # Determine execution mode (Directory scan vs Single File)
@@ -462,7 +495,13 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     print("Checking Tor connection...", flush=True)
     try:
-        using_tor = is_using_tor(timeout=args.timeout)
+        if proxy_url:
+            with requests.Session() as session:
+                session.trust_env = False
+                session.proxies = {"http": proxy_url, "https": proxy_url}
+                using_tor = is_using_tor(session=session, timeout=args.timeout)
+        else:
+            using_tor = is_using_tor(timeout=args.timeout)
     except (requests.RequestException, ValueError) as error:
         print(f"Tor status: UNKNOWN (diagnostic failed: {error})", flush=True)
     else:
@@ -500,6 +539,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             max_workers=args.workers,
             timeout=args.timeout,
             on_result=print_result,
+            proxy_url=proxy_url,
             on_wait=lambda completed, total: print(
                 f"Still checking: {completed}/{total} URLs completed; waiting for network responses...",
                 flush=True,
